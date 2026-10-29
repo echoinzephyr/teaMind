@@ -1,0 +1,22 @@
+[
+  {
+    "id": "sheet-one", "class": "sheet", "title": "中文导图 🍵", "custom-sheet": {"preserved": true},
+    "rootTopic": {
+      "id": "root", "class": "topic", "title": "光纤", "structureClass": "org.xmind.ui.map.unbalanced", "custom-topic": "保留未知字段",
+      "notes": {"plain": {"content": "中文备注\n第二行"}},
+      "children": {
+        "attached": [
+          {"id": "structure", "title": "结构", "style": {"id": "style-a", "properties": {"fill-color": "#FF4343", "fo:font-size": "20pt", "custom-property": "preserved"}}, "image": {"src": "xap:resources/sample.png"}, "children": {"attached": [{"id": "core", "title": "纤芯"}, {"id": "cladding", "title": "包层"}]}},
+          {"id": "features", "title": "特性", "labels": ["重要"], "markers": [{"markerId": "priority-1"}], "href": "https://example.com", "branch": "folded", "children": {"attached": [{"id": "optics", "title": "光学"}]}},
+          {"id": "testing", "title": "连接测试", "href": "xap:resources/manual.txt"}
+        ],
+        "detached": [{"id": "floating", "title": "自由主题", "position": {"x": 500, "y": 400}}],
+        "summary": [{"id": "summary-topic", "title": "结构与特性"}]
+      },
+      "boundaries": [{"id": "boundary", "range": "(0,1)", "title": "基础知识", "custom-boundary": true}],
+      "summaries": [{"id": "summary", "range": "(0,1)", "topicId": "summary-topic"}]
+    },
+    "relationships": [{"id": "relation", "class": "relationship", "end1Id": "structure", "end2Id": "features", "title": "决定", "controlPoints": {"0": {"x": 20, "y": 30}}}]
+  },
+  {"id": "sheet-two", "class": "sheet", "title": "第二画布", "rootTopic": {"id": "root-two", "title": "计划", "structureClass": "org.xmind.ui.logic.right"}}
+]

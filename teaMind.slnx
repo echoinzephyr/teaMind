@@ -1,0 +1,12 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Folder Name="/src/">
+    <Project Path="src/TeaMind.Core/TeaMind.Core.csproj" />
+    <Project Path="src/TeaMind.App/TeaMind.App.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/TeaMind.Tests/TeaMind.Tests.csproj" />
+  </Folder>
+</Solution>
