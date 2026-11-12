@@ -242,8 +242,11 @@ public static class MindMapBalancer
     public static Dictionary<string, TopicSide> Resolve(MapSheet sheet, ITextMeasurer? measurer = null)
     {
         measurer ??= new ApproximateTextMeasurer();
-        var heights = sheet.Root.Children.ToDictionary(t => t.Id, t => BranchHeight(t, measurer));
         var result = sheet.Root.Children.Where(t => t.Side != TopicSide.Auto).ToDictionary(t => t.Id, t => t.Side);
+        // Most layouts already have stable directions. No subtree measurement is
+        // needed until a new branch actually needs a side assignment.
+        if (result.Count == sheet.Root.Children.Count) return result;
+        var heights = sheet.Root.Children.ToDictionary(t => t.Id, t => BranchHeight(t, measurer));
         var left = result.Where(p => p.Value == TopicSide.Left).Sum(p => heights[p.Key] + 24);
         var right = result.Where(p => p.Value == TopicSide.Right).Sum(p => heights[p.Key] + 24);
         foreach (var topic in sheet.Root.Children.Where(t => t.Side == TopicSide.Auto))

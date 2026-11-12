@@ -41,6 +41,8 @@ public sealed partial class MainWindow : Window
     private string homeCategory = "recent";
     private string documentTabSignature = "";
     private string sheetTabSignature = "";
+    private bool refreshPending;
+    private bool refreshQueued;
     private readonly Dictionary<string, long> recoveryRevisions = [];
     public MainWindow()
     {
@@ -80,6 +82,13 @@ public sealed partial class MainWindow : Window
         await Guard(async () =>
         {
             var arguments = Environment.GetCommandLineArgs();
+            var interactionIndex = Array.IndexOf(arguments, "--interaction-perf-test");
+            if (interactionIndex >= 0 && arguments.Length > interactionIndex + 1)
+            {
+                await InteractionPerformanceTestAsync(arguments[interactionIndex + 1]);
+                if (arguments.Contains("--close-after-test")) { closingAllowed = true; Close(); }
+                return;
+            }
             var performanceIndex = Array.IndexOf(arguments, "--window-perf-test");
             if (performanceIndex >= 0 && arguments.Length > performanceIndex + 1)
             {
@@ -128,12 +137,24 @@ public sealed partial class MainWindow : Window
     }
     private void SessionChanged(DocumentSession session)
     {
-        if (session == active) { MapView.Rebuild(); RefreshAll(); }
+        if (session == active) { MapView.RequestRebuild(); RequestRefresh(); }
         else RefreshDocumentTabs();
         recoveryTimer.Stop(); recoveryTimer.Start();
     }
+    private void RequestRefresh()
+    {
+        refreshPending = true;
+        if (refreshQueued) return;
+        refreshQueued = DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
+        {
+            refreshQueued = false;
+            if (refreshPending && active != null) RefreshAll();
+        });
+    }
     private void RefreshAll()
     {
+        refreshPending = false;
+        refreshCount++;
         RefreshDocumentTabs(); RefreshSheetTabs(); RefreshOutline(); RefreshInspector();
         UndoButton.IsEnabled = active.CanUndo; RedoButton.IsEnabled = active.CanRedo;
         Title = $"{active.Document.Title}{(active.IsDirty ? " *" : "")} — teaMind";
@@ -711,6 +732,7 @@ public sealed partial class MainWindow : Window
             {
                 MapView.ChangeZoom(zoom / MapView.Zoom); MapView.CenterOn(child.Id); MapView.BeginEdit();
                 await MapView.SetEditorTextForValidationAsync("中文输入测试");
+                await MapView.WaitForDrawForValidationAsync();
                 if (active.Sheet.Find(child.Id)?.Text != "新主题") throw new InvalidOperationException($"编辑预览提前修改了文档，缩放 {zoom}，当前文字：{active.Sheet.Find(child.Id)?.Text}。");
                 samples.Add(MapView.InspectEditorForValidation());
                 await CaptureViewAsync(Path.Combine(directory, $"editing-{zoom:0.0}.png"));
@@ -719,6 +741,11 @@ public sealed partial class MainWindow : Window
                 if (active.Sheet.Find(child.Id)?.Text != "中文输入测试") throw new InvalidOperationException("原生输入框文字提交失败。");
                 active.Undo(); active.Select(child.Id); MapView.Rebuild();
             }
+            var beforeCancelledDraft = ModelJson.Serialize(active.Document);
+            MapView.BeginEdit(); await MapView.SetEditorTextForValidationAsync(new string('茶', 80));
+            MapView.CancelEditForValidation(); await MapView.WaitForDrawForValidationAsync();
+            if (ModelJson.Serialize(active.Document) != beforeCancelledDraft || MapView.Scene.Nodes.Single(n => n.Topic.Id == child.Id).Lines.Single() != "新主题")
+                throw new InvalidOperationException("取消待绘制的文字预览后，草稿仍影响文档或画布。");
             var scale = RootGrid.XamlRoot.RasterizationScale;
             var origin = new NativePoint(); ClientToScreen(hwnd, ref origin);
             var hitTests = new List<object>();

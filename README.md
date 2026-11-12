@@ -57,6 +57,10 @@ PNG、SVG、PDF 导出当前画布并保留折叠状态；Markdown 和 Xmind 导
 $env:MSBuildEnableWorkloadResolver = 'false'
 dotnet run --project tests/TeaMind.Tests/TeaMind.Tests.csproj -c Release -- artifacts/tests
 ./scripts/run.ps1 -SmokeTest
+./scripts/run.ps1 -InteractionTest -CloseAfterTest
+./scripts/run.ps1 -WindowRegressionTest -CloseAfterTest
 ```
 
 测试夹具为手工构造的现代 Xmind 格式样本，不能代替真实客户端兼容测试。运行验证输出放在 `artifacts`；不提交构建输出与依赖缓存。
+
+已完成第一轮本机 Xmind 处理逻辑与主题分析，涵盖新增/移动/删除、历史记录、分支平衡、配色与样式组合、样式继承和切换时的覆盖清理，详见 [分析记录](docs/XMIND-BEHAVIOR.md)。原生性能诊断的范围和局限见 [性能调查](docs/XMIND-INVESTIGATION.md)。

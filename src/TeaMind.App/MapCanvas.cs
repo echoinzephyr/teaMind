@@ -25,8 +25,14 @@ public sealed class MapCanvas : UserControl
     private DocumentSession? session;
     private string? editingId;
     private bool rebuilding;
+    private bool layoutPending;
+    private bool draftPending;
     private bool fitToViewport = true;
-    private CanvasCommandList? sceneDrawing;
+    private CanvasRenderTarget? sceneDrawing;
+    private readonly Microsoft.UI.Dispatching.DispatcherQueueTimer zoomRefinement;
+    private readonly Microsoft.UI.Dispatching.DispatcherQueueTimer draftLayoutTimer;
+    private double drawingZoom;
+    private float drawingDpi;
     private bool drawingDirty = true;
     private RectD? drawingCoverage;
     private int drawingDetailBand;
@@ -41,7 +47,11 @@ public sealed class MapCanvas : UserControl
     private bool space;
     private RectD? marquee;
     private int assetGeneration;
-    public MapScene Scene { get; private set; } = new();
+    private long layoutCount, drawCount, cacheBuildCount;
+    private double layoutMilliseconds, drawMilliseconds, cacheBuildMilliseconds;
+    internal CanvasWorkSnapshot WorkSnapshot => new(layoutCount, layoutMilliseconds, drawCount, drawMilliseconds, cacheBuildCount, cacheBuildMilliseconds);
+    private MapScene scene = new();
+    public MapScene Scene { get { EnsureLayout(); return scene; } private set => scene = value; }
     public Dictionary<string, CanvasBitmap> Bitmaps { get; } = [];
     public CanvasDevice Device => drawingDevice ?? CanvasDevice.GetSharedDevice();
     public Task Ready => resourcesReady.Task;
@@ -54,6 +64,17 @@ public sealed class MapCanvas : UserControl
     public event Action<VirtualKey, bool, bool>? Shortcut;
     public MapCanvas()
     {
+        draftLayoutTimer = DispatcherQueue.CreateTimer();
+        draftLayoutTimer.Interval = TimeSpan.FromMilliseconds(50);
+        draftLayoutTimer.IsRepeating = false;
+        draftLayoutTimer.Tick += (_, _) => { if (draftPending) RequestRebuild(); };
+        zoomRefinement = DispatcherQueue.CreateTimer();
+        zoomRefinement.Interval = TimeSpan.FromMilliseconds(120);
+        zoomRefinement.IsRepeating = false;
+        zoomRefinement.Tick += (_, _) =>
+        {
+            if (sceneDrawing != null && Math.Abs(drawingZoom - Zoom) > .0001) { drawingDirty = true; canvas.Invalidate(); }
+        };
         IsTabStop = true;
         editor.Style = (Style)Application.Current.Resources["NodeTextEditorStyle"];
         editor.SelectionHighlightColor = new SolidColorBrush(SceneRenderer.Color("#35775C"));
@@ -87,7 +108,14 @@ public sealed class MapCanvas : UserControl
             }
             CommitEdit();
         });
-        editor.TextChanged += (_, _) => { if (editingId != null) { Rebuild(); PositionEditor(); } };
+        editor.TextChanged += (_, _) =>
+        {
+            if (editingId == null) return;
+            draftPending = true;
+            // Native input stays immediate. Bound expensive draft geometry updates
+            // during continuous typing without resetting the deadline on each key.
+            if (!draftLayoutTimer.IsRunning) draftLayoutTimer.Start();
+        };
         editor.KeyDown += (_, args) =>
         {
             if (args.Key == VirtualKey.Escape) { EndEdit(); Focus(FocusState.Programmatic); args.Handled = true; }
@@ -99,18 +127,32 @@ public sealed class MapCanvas : UserControl
     {
         CommitEdit(); session = value; assetGeneration++; Rebuild(); _ = LoadImagesAsync(assetGeneration); Fit();
     }
-    public void Rebuild()
+    // Merge changes until the next native draw. Geometry consumers (hit testing,
+    // editing and export) flush first, so deferred drawing never exposes stale bounds.
+    public void RequestRebuild() { layoutPending = true; canvas.Invalidate(); }
+    private void EnsureLayout(bool flushDraft = true)
+    {
+        if (flushDraft && draftPending) layoutPending = true;
+        if (!layoutPending || rebuilding) return;
+        LayoutNow(flushDraft); PositionEditor();
+    }
+    public void Rebuild() => LayoutNow(true);
+    private void LayoutNow(bool invalidate)
     {
         if (session == null || rebuilding) return;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        layoutPending = false;
+        draftPending = false; draftLayoutTimer.Stop();
         rebuilding = true;
         try
         {
             IReadOnlyDictionary<string, string>? preview = editingId == null ? null : new Dictionary<string, string> { [editingId] = editor.Text };
             Scene = new MapLayoutEngine().Layout(session.Sheet, measurer, preview);
-            drawingDirty = true; canvas.ClearColor = SceneRenderer.Color(Scene.Background); canvas.Invalidate();
+            drawingDirty = true; canvas.ClearColor = SceneRenderer.Color(scene.Background);
+            if (invalidate) canvas.Invalidate();
         }
         catch (Exception ex) { Error?.Invoke(ex.Message); }
-        finally { rebuilding = false; }
+        finally { rebuilding = false; layoutCount++; layoutMilliseconds += System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds; }
     }
     public void Invalidate() => canvas.Invalidate();
     public async Task RefreshImagesAsync() => await LoadImagesAsync(++assetGeneration);
@@ -148,6 +190,7 @@ public sealed class MapCanvas : UserControl
         fitToViewport = false;
         Zoom = Math.Clamp(Zoom * factor, 0.08, 4);
         pan = new((float)(cx - world.X * Zoom), (float)(cy - world.Y * Zoom)); ZoomChanged?.Invoke(Zoom); canvas.Invalidate();
+        zoomRefinement.Stop(); zoomRefinement.Start();
     }
     public void CenterOn(string id)
     {
@@ -185,30 +228,45 @@ public sealed class MapCanvas : UserControl
         if (session == null || editingId == null) return;
         var id = editingId; var text = editor.Text; EndEdit(false);
         if (session.Sheet.Find(id) is { } topic && topic.Text != text) session.Execute("编辑文字", _ => topic.Text = text);
-        else Rebuild();
+        else RequestRebuild();
     }
-    private void EndEdit(bool rebuild = true) { editingId = null; editor.Visibility = Visibility.Collapsed; overlay.IsHitTestVisible = false; drawingDirty = true; if (rebuild) Rebuild(); canvas.Invalidate(); }
+    private void EndEdit(bool rebuild = true) { editingId = null; draftPending = false; draftLayoutTimer.Stop(); editor.Visibility = Visibility.Collapsed; overlay.IsHitTestVisible = false; drawingDirty = true; if (rebuild) RequestRebuild(); canvas.Invalidate(); }
     private void Draw(CanvasControl sender, CanvasDrawEventArgs args)
     {
         var watch = System.Diagnostics.Stopwatch.StartNew();
+        EnsureLayout(false);
         var ds = args.DrawingSession;
         var viewport = new RectD(-pan.X / Zoom, -pan.Y / Zoom, ActualWidth / Zoom, ActualHeight / Zoom);
         var detailBand = Zoom < .34 ? 0 : 1;
-        if (drawingDirty || sceneDrawing == null || drawingCoverage == null || drawingDetailBand != detailBand || !drawingCoverage.Value.Contains(new(viewport.X, viewport.Y)) || !drawingCoverage.Value.Contains(new(viewport.Right, viewport.Bottom)))
+        if (drawingDirty || sceneDrawing == null || drawingCoverage == null || drawingDetailBand != detailBand || drawingDpi != sender.Dpi || Zoom / drawingZoom is < .8 or > 1.2 || !drawingCoverage.Value.Contains(new(viewport.X, viewport.Y)) || !drawingCoverage.Value.Contains(new(viewport.Right, viewport.Bottom)))
         {
-            sceneDrawing?.Dispose(); sceneDrawing = new CanvasCommandList(sender);
+            var cacheStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            sceneDrawing?.Dispose();
             drawingCoverage = viewport.Inflate(300 / Zoom); drawingDetailBand = detailBand;
-            using (var cached = sceneDrawing.CreateDrawingSession()) SceneRenderer.Draw(cached, Scene, Bitmaps, viewport: drawingCoverage, editingId: editingId, detailScale: Zoom);
+            drawingZoom = Zoom; drawingDpi = sender.Dpi;
+            var coverage = drawingCoverage.Value;
+            var width = (float)Math.Ceiling(coverage.Width * Zoom); var height = (float)Math.Ceiling(coverage.Height * Zoom);
+            // Bound the backing texture to 16 million pixels (64 MB) and 8192 px
+            // per dimension, including high-DPI windows. Exports remain vector based.
+            var dpi = (float)Math.Min(sender.Dpi, 96 * Math.Min(Math.Sqrt(16_000_000d / (width * height)), 8192d / Math.Max(width, height)));
+            sceneDrawing = new CanvasRenderTarget(sender, width, height, dpi);
+            using (var cached = sceneDrawing.CreateDrawingSession())
+            {
+                cached.Clear(Microsoft.UI.Colors.Transparent);
+                cached.Transform = Matrix3x2.CreateTranslation((float)-coverage.X, (float)-coverage.Y) * Matrix3x2.CreateScale((float)Zoom);
+                SceneRenderer.Draw(cached, scene, Bitmaps, viewport: drawingCoverage, editingId: editingId, detailScale: Zoom);
+            }
             drawingDirty = false;
+            cacheBuildCount++; cacheBuildMilliseconds += System.Diagnostics.Stopwatch.GetElapsedTime(cacheStarted).TotalMilliseconds;
         }
         ds.Transform = Matrix3x2.CreateScale((float)Zoom) * Matrix3x2.CreateTranslation(pan);
-        ds.DrawImage(sceneDrawing);
+        ds.DrawImage(sceneDrawing, SceneRenderer.ToRect(drawingCoverage!.Value), new Windows.Foundation.Rect(0, 0, sceneDrawing.Size.Width, sceneDrawing.Size.Height));
         if (session != null)
-            foreach (var node in Scene.Nodes.Where(n => session.SelectedIds.Contains(n.Topic.Id) && n.Topic.Id != editingId))
+            foreach (var node in scene.Nodes.Where(n => session.SelectedIds.Contains(n.Topic.Id) && n.Topic.Id != editingId))
                 ds.DrawRoundedRectangle(SceneRenderer.ToRect(node.Bounds.Inflate(4)), 12, 12, SceneRenderer.Color("#4E9B78"), 2);
         if (dragged && dragId != null && down.HasValue)
         {
-            var node = Scene.Nodes.FirstOrDefault(n => n.Topic.Id == dragId);
+            var node = scene.Nodes.FirstOrDefault(n => n.Topic.Id == dragId);
             if (node != null) ds.DrawRoundedRectangle(SceneRenderer.ToRect(node.Bounds.Inflate(8)), 12, 12, SceneRenderer.Color("#4E9B78"), 2);
         }
         if (marquee.HasValue)
@@ -216,7 +274,8 @@ public sealed class MapCanvas : UserControl
             var c = SceneRenderer.Color("#4E9B78"); c.A = 30; ds.FillRectangle(SceneRenderer.ToRect(marquee.Value), c);
             ds.DrawRectangle(SceneRenderer.ToRect(marquee.Value), SceneRenderer.Color("#4E9B78"), 1);
         }
-        watch.Stop(); frameTimes.Enqueue(watch.Elapsed.TotalMilliseconds); if (frameTimes.Count > 120) frameTimes.Dequeue();
+        watch.Stop(); drawCount++; drawMilliseconds += watch.Elapsed.TotalMilliseconds;
+        frameTimes.Enqueue(watch.Elapsed.TotalMilliseconds); if (frameTimes.Count > 120) frameTimes.Dequeue();
     }
     private void Pressed(object sender, PointerRoutedEventArgs args)
     {
@@ -360,6 +419,22 @@ public sealed class MapCanvas : UserControl
         editor.TextChanged += Handler;
         try { editor.Text = text; await changed.Task.WaitAsync(TimeSpan.FromSeconds(3)); }
         finally { editor.TextChanged -= Handler; }
+    }
+    internal void PanForValidation(double x, double y)
+    {
+        fitToViewport = false; pan += new Vector2((float)x, (float)y); canvas.Invalidate();
+    }
+    internal void CancelEditForValidation() => EndEdit();
+    internal async Task WaitForDrawForValidationAsync()
+    {
+        EnsureLayout();
+        var before = drawCount; var deadline = Environment.TickCount64 + 3000;
+        canvas.Invalidate();
+        while (drawCount == before || drawingDirty || layoutPending || draftPending)
+        {
+            if (Environment.TickCount64 > deadline) throw new TimeoutException("画布没有绘制最新布局。");
+            await Task.Delay(10);
+        }
     }
     internal object InspectEditorForValidation()
     {
